@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Prabin Agarwal — Brand Reveal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  @font-face { font-family: 'Bebas'; src: url('../../brand/fonts/BebasNeue.woff2') format('woff2'); }
+  @font-face { font-family: 'Lato'; font-style: italic; src: url('../../brand/fonts/Lato-Italic.woff2') format('woff2'); }
+  @font-face { font-family: 'Lato'; font-weight: 400; src: url('../../brand/fonts/Lato-Regular.woff2') format('woff2'); }
+  @font-face { font-family: 'Lato'; font-weight: 700; src: url('../../brand/fonts/Lato-Bold.woff2') format('woff2'); }
+  html, body { margin: 0; background: #111; }
+  canvas { display: block; width: 1080px; height: 1920px; }
+  body.preview canvas { width: auto; height: 100vh; margin: 0 auto; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+// ---------------------------------------------------------------------------
+// Brand reveal — Prabin Agarwal, Empowering Investors. 1080x1920, 15 s.
+// Render contract: seek(t) paints frame t from t alone. No timers, no state.
+// ---------------------------------------------------------------------------
+const W = 1080, H = 1920, DUR = 15;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+
+const C = { navy: '#1B3041', slate: '#435766', orange: '#D45C36', orangeLt: '#DA7B5E', paper: '#FFFFFF', ink: '#1B3041', mute: '#5C6B78' };
+
+// Measured beat grid (beats.json, injected by render.mjs); 120 bpm fallback for preview.
+const GRID = (window.BEATS && window.BEATS.beats) || Array.from({ length: 31 }, (_, i) => i * 0.5);
+const PER = GRID.length > 1 ? GRID[1] - GRID[0] : 0.5;
+const B = n => { const i = Math.floor(n), f = n - i; const a = GRID[i] ?? GRID[0] + i * PER; return a + f * PER; };
+
+// --- seeded noise -----------------------------------------------------------
+function mulberry32(a) { return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const hash = (...k) => mulberry32(k.reduce((h, v) => Math.imul(h ^ (v | 0), 2654435761) >>> 0, 41541))();
+
+// --- easing -----------------------------------------------------------------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, p) => a + (b - a) * p;
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+const eOut = p => 1 - Math.pow(1 - p, 4);
+const eExpo = p => p >= 1 ? 1 : 1 - Math.pow(2, -10 * p);
+const eInOut = p => p < 0.5 ? 8 * p ** 4 : 1 - Math.pow(-2 * p + 2, 4) / 2;
+const eBack = p => { const c = 1.9; return 1 + (c + 1) * Math.pow(p - 1, 3) + c * Math.pow(p - 1, 2); };
+// damped kick on a beat: 0 at the beat, peaks fast, settles
+const pulse = (t, at, decay = 9) => t < at ? 0 : Math.exp(-(t - at) * decay) * Math.sin(Math.min(Math.PI / 2, (t - at) * 40));
+
+// --- logo geometry (measured from brand/logo.png, 1600x900 space) ------------
+const PIECES = [
+  { id: 'slateCol', fill: C.slate,    pts: [[202,132],[307,237],[307,405],[202,405]] },
+  { id: 'navyTop',  fill: C.navy,     pts: [[202,132],[473,132],[473,237],[307,237]] },
+  { id: 'orange',   fill: C.orange,   pts: [[307,237],[473,237],[473,405]] },
+  { id: 'orangeLt', fill: C.orangeLt, pts: [[307,237],[307,405],[473,405]] },
+  { id: 'slateLow', fill: C.slate,    pts: [[202,449],[307,449],[307,535],[202,640]] },
+  { id: 'navyPara', fill: C.navy,     pts: [[518,132],[708,132],[604,237],[518,237]] },
+].map(p => ({ ...p, c: p.pts.reduce((a, q) => [a[0] + q[0] / p.pts.length, a[1] + q[1] / p.pts.length], [0, 0]) }));
+const MARK_C = [455, 386];            // centre of the mark's bbox (202..708, 132..640)
+const LOCK_C = [779.5, 474.5];        // centre of the whole lockup (194..1365, 132..817)
+
+// scattered positions for the "every piece" scene (screen space, deg, scale)
+const SCATTER = [
+  { x: 200, y: 420,  r: -28, s: 1.05 }, { x: 600, y: 260,  r: 16, s: 0.85 },
+  { x: 870, y: 1480, r: 35, s: 1.15 },  { x: 230, y: 1520, r: -40, s: 1.1 },
+  { x: 560, y: 1720, r: 18, s: 1.0 },   { x: 880, y: 520,  r: -24, s: 0.95 },
+];
+
+// --- text helpers --------------------------------------------------------------
+const metrics = {};
+const fontStr = (family, size, weight, style) => [style, weight, size + 'px', family].filter(Boolean).join(' ');
+function capRatio(family, weight, style) { // cap height per px of font size
+  const k = fontStr(family, 100, weight, style);
+  if (metrics[k]) return metrics[k];
+  ctx.font = k; return (metrics[k] = ctx.measureText('H').actualBoundingBoxAscent / 100);
+}
+function setFont(family, capPx, weight = '', style = '') {
+  const size = capPx / capRatio(family, weight, style);
+  ctx.font = fontStr(family, size, weight, style); return size;
+}
+// draw a glyph so its ink box lands exactly on [x0..x1], baseline y (wordmark fidelity)
+function glyphFit(ch, x0, x1, y) {
+  const m = ctx.measureText(ch), inkW = m.actualBoundingBoxRight + m.actualBoundingBoxLeft;
+  ctx.save(); ctx.translate(x0, y); ctx.scale((x1 - x0) / inkW, 1); ctx.fillText(ch, m.actualBoundingBoxLeft, 0); ctx.restore();
+}
+// masked rise: text revealed from behind a baseline, never faded
+function riseText(str, x, y, capPx, p, { align = 'left', color = C.ink, family = 'Bebas', weight = '', style = '', spacing = 0 } = {}) {
+  setFont(family, capPx, weight, style); ctx.letterSpacing = spacing + 'px';
+  const w = ctx.measureText(str).width - spacing, x0 = align === 'center' ? x - w / 2 : x;
+  ctx.save(); ctx.beginPath(); ctx.rect(x0 - 40, y - capPx * 1.45, w + 80, capPx * 1.75); ctx.clip();
+  ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(str, x0, y + (1 - p) * capPx * 1.5); ctx.restore(); ctx.letterSpacing = '0px';
+  return w;
+}
+
+// --- lockup layout -------------------------------------------------------------
+const PRABIN = [[516,625],[671,785],[822,951],[995,1109],[1158,1195],[1248,1365]];
+const AGARWAL = [[512,567],[646,693],[772,827],[907,957],[1035,1112],[1188,1243],[1323,1365]];
+const LOCK_S = 0.78, LOCK_Y = 700;   // kept above the Reels/Shorts caption zone    // final lockup scale and centre on screen
+
+// mark transform (logo space -> screen) over time
+function markXform(t) {
+  const big = { s: 1.45, x: W / 2 - MARK_C[0] * 1.45, y: 900 - MARK_C[1] * 1.45 };
+  const lock = { s: LOCK_S, x: W / 2 - LOCK_C[0] * LOCK_S, y: LOCK_Y - LOCK_C[1] * LOCK_S };
+  const p = eInOut(prog(t, B(16) - 0.05, B(17.2)));
+  const s = lerp(big.s, lock.s, p);
+  // keep it alive: slow breathe while assembled, then a gentle push on the end card
+  const push = 1 + 0.035 * eOut(prog(t, B(22), DUR));
+  const cx = W / 2, cy = lerp(900, LOCK_Y, p);
+  return { s: s * push, x: cx + (lerp(big.x, lock.x, p) - cx) * push, y: cy + (lerp(big.y, lock.y, p) - cy) * push };
+}
+
+// --- scene 1: markets move ------------------------------------------------------
+function chartY(i, t) { // jagged series that re-rolls on every beat
+  const beat = Math.floor((t - GRID[0]) / PER), f = ((t - GRID[0]) / PER) - beat;
+  const v = k => (hash(i, k) - 0.5) * 2 * (0.35 + 0.65 * hash(i * 7, k));
+  return lerp(v(beat - 1), v(beat), eExpo(clamp(f / 0.35)));
+}
+function sceneMarkets(t) {
+  ctx.fillStyle = C.navy; ctx.fillRect(0, 0, W, H);
+  // chart band
+  const N = 22, x0 = -20, x1 = W + 20, cy = 1440, amp = 280;
+  const draw = clamp(eOut(prog(t, -0.35, B(3))));
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 2;
+  for (let g = -1; g <= 1; g++) { ctx.beginPath(); ctx.moveTo(0, cy + g * amp); ctx.lineTo(W, cy + g * amp); ctx.stroke(); }
+  ctx.beginPath();
+  const upto = draw * (N - 1);
+  for (let i = 0; i <= Math.ceil(upto); i++) {
+    const k = Math.min(i, upto), x = lerp(x0, x1, k / (N - 1));
+    const y = cy - amp * lerp(chartY(Math.floor(k), t), chartY(Math.ceil(k), t), k % 1);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.strokeStyle = C.orange; ctx.lineWidth = 12; ctx.lineJoin = 'miter'; ctx.lineCap = 'butt'; ctx.stroke();
+  // live head
+  const hx = lerp(x0, x1, upto / (N - 1)), hy = cy - amp * lerp(chartY(Math.floor(upto), t), chartY(Math.ceil(upto), t), upto % 1);
+  ctx.fillStyle = C.orange; ctx.fillRect(hx - 14, hy - 14, 28, 28);
+  ctx.restore();
+  // type: hard rises on the downbeats
+  const kick = 1 + 0.02 * pulse(t, B(2));
+  ctx.save(); ctx.translate(W / 2, 640); ctx.scale(kick, kick); ctx.translate(-W / 2, -640);
+  riseText('MARKETS', 72, 600, fitCap('MARKETS', W - 144), eExpo(prog(t, -0.12, B(0) + 0.45)), { color: '#FFFFFF' });
+  riseText('MOVE.', 72, 960, fitCap('MARKETS', W - 144), eExpo(prog(t, B(2) - 0.08, B(2) + 0.3)), { color: C.orange });
+  ctx.restore();
+}
+
+// --- scene 2: every piece in its place --------------------------------------------
+function piecePose(i, t) {
+  const sc = SCATTER[i], m = markXform(t), p = PIECES[i];
+  const enter = eExpo(prog(t, B(5) + i * 0.07, B(6) + i * 0.07));          // fly in from off-frame
+  const drift = t * 0.6 + i;
+  const fx = sc.x + Math.sin(drift) * 18, fy = sc.y + Math.cos(drift * 0.8) * 14 + (1 - enter) * (sc.y < 960 ? -700 : 700);
+  const fr = sc.r + Math.sin(drift * 0.7) * 6, fs = sc.s * 1.45;
+  // eBack first touches its target at p = 0.345, so contact lands exactly on beat 10+i
+  const lock = eBack(prog(t, B(10 + i) - 0.138, B(10 + i) + 0.262));
+  return {
+    x: lerp(fx, m.x + p.c[0] * m.s, lock), y: lerp(fy, m.y + p.c[1] * m.s, lock),
+    r: lerp(fr, 0, clamp(lock)), s: lerp(fs, m.s, clamp(lock)), locked: lock,
+  };
+}
+function drawPiece(p, pose) {
+  ctx.save(); ctx.translate(pose.x, pose.y); ctx.rotate(pose.r * Math.PI / 180); ctx.scale(pose.s, pose.s);
+  ctx.beginPath(); p.pts.forEach(([x, y], k) => k ? ctx.lineTo(x - p.c[0], y - p.c[1]) : ctx.moveTo(x - p.c[0], y - p.c[1])); ctx.closePath();
+  ctx.fillStyle = p.fill; ctx.fill(); ctx.restore();
+}
+// motion blur: sub-frame trails across a 180° shutter (1/60 s), only for fast loose pieces
+function drawPieceBlurred(p, i, t) {
+  const now = piecePose(i, t), prev = piecePose(i, t - 1 / 60);
+  const moved = Math.hypot(now.x - prev.x, now.y - prev.y) + Math.abs(now.r - prev.r) * 4;
+  if (moved >= 6 && now.locked < 1) {           // trails under an opaque body; none once locked
+    const n = Math.min(8, Math.ceil(moved / 6));
+    ctx.save(); ctx.globalAlpha = 0.5 / n;
+    for (let k = 1; k <= n; k++) drawPiece(p, piecePose(i, t - (1 / 60) * (k / n)));
+    ctx.restore();
+  }
+  drawPiece(p, now);
+}
+function scenePieces(t) {
+  // copy lands, then exits upward behind its own mask on beat 9
+  const out = eInOut(prog(t, B(9), B(9) + 0.5));
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
+  ctx.translate(0, -out * 260);
+  const a = eExpo(prog(t, B(5) - 0.1, B(5) + 0.35)), b = eExpo(prog(t, B(7), B(7) + 0.5));
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, 1040 - out * 520); ctx.clip();
+  riseText('EVERY PIECE', W / 2, 900, 150, a, { align: 'center' });
+  ctx.restore();
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, 1260 - out * 520); ctx.clip();
+  riseText('IN ITS PLACE.', W / 2, 1110, 150, b, { align: 'center', color: C.orange });
+  ctx.restore();
+  ctx.restore();
+}
+
+// --- diagonal wipe (45°, the mark's own angle) ---------------------------------
+function wipe(t) {
+  const p = eInOut(prog(t, B(4.5), B(5)));
+  if (p <= 0) return false;
+  const d = lerp(-W, W + H, p);
+  // paper triangle grows from the top-left corner, an orange band rides its edge
+  ctx.save();
+  ctx.fillStyle = C.paper; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(d, 0); ctx.lineTo(0, d); ctx.closePath(); ctx.fill();
+  if (p < 1) {
+    ctx.fillStyle = C.orange; ctx.beginPath();
+    ctx.moveTo(d, 0); ctx.lineTo(d + 70, 0); ctx.lineTo(0, d + 70); ctx.lineTo(0, d); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+  return p >= 1;
+}
+
+// --- wordmark + tagline ------------------------------------------------------------
+let TAG = null;
+const TAG_SKEW = -0.02;
+function tagLayout() {
+  if (TAG) return TAG;
+  // each word's ink fitted to its measured span in the logo
+  setFont('Lato', 72, '', 'italic'); ctx.letterSpacing = '0px';
+  TAG = { font: ctx.font, words: [['Empowering', 194, 834], ['Investors', 876, 1359]].map(([w, x0, x1]) => {
+    const m = ctx.measureText(w), ink = m.actualBoundingBoxRight + m.actualBoundingBoxLeft;
+    return { w, x: x0 + m.actualBoundingBoxLeft, spacing: (x1 - x0 - ink) / (w.length - 1) };
+  }) };
+  return TAG;
+}
+function wordmark(t) {
+  const m = markXform(t);
+  ctx.save(); ctx.translate(m.x, m.y); ctx.scale(m.s, m.s);
+  ctx.fillStyle = C.navy;
+  // PRABIN: each letter rises behind the cap line, one per eighth after the hit
+  setFont('Bebas', 235);
+  ctx.save(); ctx.beginPath(); ctx.rect(480, 262, 920, 250); ctx.clip();
+  'PRABIN'.split('').forEach((ch, i) => {
+    const p = eExpo(prog(t, B(16.5 + i * 0.25) - 0.1, B(16.5 + i * 0.25) + 0.3));
+    ctx.save(); ctx.translate(0, (1 - p) * 250); glyphFit(ch, PRABIN[i][0], PRABIN[i][1], 507); ctx.restore();
+  });
+  ctx.restore();
+  // AGARWAL: tracks in from wide spacing to its measured slots
+  setFont('Bebas', 104);
+  const q = eExpo(prog(t, B(18), B(19)));
+  ctx.save(); ctx.beginPath(); ctx.rect(480, 530, 920, 120); ctx.clip();
+  'AGARWAL'.split('').forEach((ch, i) => {
+    const [x0, x1] = AGARWAL[i], cx = (x0 + x1) / 2, from = 940 + (cx - 940) * 2.6;
+    const dx = lerp(from, cx, q) - cx, dy = (1 - q) * 120;
+    glyphFit(ch, x0 + dx, x1 + dx, 644 + dy);
+  });
+  ctx.restore();
+  // tagline: left-to-right reveal with an orange cursor bar on its edge
+  const tg = tagLayout(), w = eInOut(prog(t, B(20), B(21.5)));
+  if (w > 0) {
+    const edge = lerp(180, 1380, w);
+    ctx.save(); ctx.beginPath(); ctx.rect(150, 700, edge - 150, 140); ctx.clip();
+    ctx.font = tg.font; ctx.fillStyle = C.orange;
+    // italic angle corrected to match the logo's tagline (skew about the baseline)
+    ctx.translate(0, 799); ctx.transform(1, 0, TAG_SKEW, 1, 0, 0); ctx.translate(0, -799);
+    tg.words.forEach(o => { ctx.letterSpacing = o.spacing + 'px'; ctx.fillText(o.w, o.x - TAG_SKEW * 36, 799); });
+    ctx.letterSpacing = '0px'; ctx.restore();
+    if (w < 1) { ctx.fillStyle = C.orange; ctx.fillRect(edge, 712, 8, 110); }
+  }
+  ctx.restore();
+}
+
+// --- end card: identity + exact AMFI disclaimer ---------------------------------------
+const DISCLAIMER = 'Probin Agarwalla (ARN- 41541) AMFI Registered Mutual Fund Distributor & SIF Distributor. Mutual fund investments are subject to market risks. Read all scheme related documents carefully.';
+function wrap(str, maxW) {
+  const words = str.split(' '), lines = []; let line = '';
+  for (const w of words) { const tryL = line ? line + ' ' + w : w; if (ctx.measureText(tryL).width > maxW && line) { lines.push(line); line = w; } else line = tryL; }
+  lines.push(line); return lines;
+}
+function endCard(t) {
+  const y0 = 1060;
+  // rule draws out from the left
+  const r = eInOut(prog(t, B(22), B(23)));
+  ctx.fillStyle = C.navy; ctx.fillRect(96, y0, (W - 192) * r, 4);
+  riseText('AMFI-registered Mutual Fund Distributor', 96, y0 + 96, fitCap('AMFI-registered Mutual Fund Distributor', W - 192, 'Lato', '700'), eExpo(prog(t, B(22) + 0.15, B(22) + 0.7)), { family: 'Lato', weight: '700', color: C.navy });
+  riseText('ARN-41541', 96, y0 + 180, 36, eExpo(prog(t, B(22) + 0.3, B(22) + 0.85)), { family: 'Lato', weight: '700', color: C.orange });
+  riseText('prabinagarwal.com', W - 96 - textW('prabinagarwal.com', 36, '400'), y0 + 180, 36, eExpo(prog(t, B(22) + 0.3, B(22) + 0.85)), { family: 'Lato', weight: '400', color: C.navy });
+  // disclaimer block, line by line on beat 24
+  setFont('Lato', 27, '400'); const lines = wrap(DISCLAIMER, W - 192);
+  lines.forEach((ln, i) => riseText(ln, 96, y0 + 320 + i * 54, 27, eExpo(prog(t, B(24) + i * 0.08, B(24) + 0.5 + i * 0.08)), { family: 'Lato', weight: '400', color: C.mute }));
+}
+// largest cap height at which str fits maxW
+function fitCap(str, maxW, family = 'Bebas', weight = '') { setFont(family, 100, weight); return 100 * maxW / ctx.measureText(str).width; }
+function textW(s, cap, weight) { setFont('Lato', cap, weight); return ctx.measureText(s).width; }
+
+// --- frame -------------------------------------------------------------------------
+function seek(t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.letterSpacing = '0px'; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  const cam = 1 + 0.012 * pulse(t, B(16), 6);          // impact nudge on the reveal
+  ctx.fillStyle = C.paper; ctx.fillRect(0, 0, W, H);
+  ctx.translate(W / 2, H / 2); ctx.scale(cam, cam); ctx.translate(-W / 2, -H / 2);
+  const wiped = t >= B(5);
+  if (!wiped) { sceneMarkets(t); wipe(t); }
+  if (t >= B(4.5)) {
+    if (wiped) { ctx.fillStyle = C.paper; ctx.fillRect(-20, -20, W + 40, H + 40); }
+    if (t < B(10)) scenePieces(t);
+    if (t >= B(4.8)) PIECES.forEach((p, i) => drawPieceBlurred(p, i, t));
+    if (t >= B(16)) wordmark(t);
+    if (t >= B(22)) endCard(t);
+  }
+}
+
+window.seek = seek;
+window.DURATION = DUR;
+window.ready = document.fonts.load('10px Bebas').then(() => Promise.all([
+  document.fonts.load('italic 10px Lato'), document.fonts.load('10px Lato'), document.fonts.load('700 10px Lato')
+])).then(() => { seek(0); return true; });
+
+// Preview mode only (not used by render.mjs): play with the score on click.
+if (!new URLSearchParams(location.search).has('render')) {
+  document.body.classList.add('preview');
+  const audio = new Audio('score.wav');
+  window.ready.then(() => {
+    const loop = () => { seek(Math.min(DUR, audio.currentTime)); requestAnimationFrame(loop); };
+    cv.addEventListener('click', () => { audio.currentTime = 0; audio.play(); });
+    requestAnimationFrame(loop);
+  });
+}
+</script>
+</body>
+</html>
