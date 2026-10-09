@@ -1,0 +1,727 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Prabin Agarwal — Journey Reveal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; background: #0A0A0C; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 56.25vw; max-height: 100vh; max-width: 177.78vh; margin: 0 auto; cursor: pointer; }
+</style>
+<script type="importmap">{ "imports": { "three": "../../node_modules/three/build/three.module.js", "three/addons/": "../../node_modules/three/examples/jsm/" } }</script>
+</head>
+<body>
+<script type="module">
+// =============================================================================
+// Journey reveal — Prabin Agarwal, Empowering Investors. 16:9, 15 s, 24 fps.
+// Render contract: seek(t) paints frame t from t alone. Every object's state is
+// recomputed from t on each call; seeded noise only; no timers in render mode.
+// Query: w (width, default 3840), spp (sub-frames per frame: motion blur + AA),
+//        variant=plate (brief: no text/logo) | branded (real mark + wordmark)
+// =============================================================================
+import * as THREE from 'three';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
+
+const Q = new URLSearchParams(location.search);
+const RENDER = Q.has('render');
+const W = +Q.get('w') || 3840, H = Math.round(W * 9 / 16);
+// sub-frames: fixed via ?spp=, else 1 in preview and a schedule in render mode (more where motion is fast)
+const SPP_FIXED = +Q.get('spp') || (RENDER ? 0 : 1);
+let VARIANT = Q.get('variant') || 'plate';
+const FPS = 24, DUR = 15, SHUTTER = 0.5 / FPS;          // 180° shutter
+
+// --- palette (brand: primary / secondary / accent + two neutrals) ------------------
+const HEX = { primary: '#1B3041', secondary: '#435766', accent: '#D45C36', black: '#0A0A0C', white: '#F4F1EA' };
+const COL = Object.fromEntries(Object.entries(HEX).map(([k, v]) => [k, new THREE.Color(v)]));
+const hdr = (c, k) => c.clone().multiplyScalar(k);
+
+// --- measured beat grid --------------------------------------------------------------
+const BEATS = window.BEATS || await fetch('beats.json').then(r => r.json());
+const GRID = BEATS.beats, PER = GRID[1] - GRID[0];
+const B = n => { const i = Math.floor(n); return (GRID[i] ?? GRID[0] + i * PER) + (n - i) * PER; };
+const HIT = { drop: B(1), sky: B(4), line: B(8), dip: B(12), sun: B(16), arch: B(20), collapse: B(23.6), still: B(24.4), big: B(25), snap: B(26) };
+
+// --- maths -----------------------------------------------------------------------------
+function mulberry32(a) { return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, p) => a + (b - a) * p;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const eOut3 = p => 1 - Math.pow(1 - p, 3);
+const eIn3 = p => p * p * p;
+const eInOut = p => p < 0.5 ? 4 * p ** 3 : 1 - Math.pow(-2 * p + 2, 3) / 2;
+const eExpo = p => p >= 1 ? 1 : 1 - Math.pow(2, -10 * p);
+const eSettle = p => p >= 1 ? 1 : 1 - Math.pow(1 - p, 3) * Math.cos(p * Math.PI * 1.6) ; // ease-out with a tiny settle
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+// --- renderer ---------------------------------------------------------------------------
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1); renderer.setSize(W, H, false);
+renderer.autoClear = false; renderer.toneMapping = THREE.NoToneMapping;
+document.body.appendChild(renderer.domElement);
+const RT = (w, h) => new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, depthBuffer: true });
+const subRT = RT(W, H), accRT = RT(W, H);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(COL.black, 0.028);
+const world = new THREE.Group(); scene.add(world);           // everything that reflects
+const floorScene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(22.9, 16 / 9, 0.05, 200); // 50 mm on full frame
+
+// studio environment for satin metal: warm-white softboxes + one low accent strip
+{
+  const env = new THREE.Scene(); env.background = COL.black.clone();
+  const box = (w, h, c, k, p, look) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: hdr(c, k), side: THREE.DoubleSide })); m.position.copy(p); m.lookAt(look); env.add(m); };
+  box(14, 3, COL.white, 3.2, V(0, 9, -2), V(0, 0, 0));
+  box(2, 9, COL.white, 1.4, V(-9, 3, 2), V(0, 2, 0));
+  box(2, 9, COL.white, 1.0, V(9, 3, 2), V(0, 2, 0));
+  box(12, 0.6, COL.accent, 2.5, V(0, 0.6, -9), V(0, 1, 0));
+  box(9, 3.5, COL.white, 1.6, V(0, 5, 13), V(0, 1.5, 0));            // soft key behind camera: satin faces read
+  const pm = new THREE.PMREMGenerator(renderer);
+  scene.environment = pm.fromScene(env, 0.04).texture; scene.environmentIntensity = 0.9;
+}
+const rim = new THREE.DirectionalLight(COL.white, 1.1); rim.position.set(-2, 6, -7); world.add(rim);
+const fill = new THREE.DirectionalLight(COL.white, 0.7); fill.position.set(3, 4, 8); world.add(fill);
+const heroLight = new THREE.PointLight(COL.accent, 0, 9, 1.6); world.add(heroLight);
+const sunLight = new THREE.DirectionalLight(COL.accent, 0); sunLight.position.set(0, 2.4, -9); world.add(sunLight);
+
+// --- shared materials / textures ------------------------------------------------------------
+const glowMat = (c, k = 4) => new THREE.MeshBasicMaterial({ color: hdr(c, k), fog: false, toneMapped: false });
+function radialTex(stops) {
+  const c = document.createElement('canvas'); c.width = c.height = 256; const g = c.getContext('2d');
+  const gr = g.createRadialGradient(128, 128, 0, 128, 128, 128); stops.forEach(([o, a]) => gr.addColorStop(o, `rgba(255,255,255,${a})`));
+  g.fillStyle = gr; g.fillRect(0, 0, 256, 256); const t = new THREE.CanvasTexture(c); return t;
+}
+const softTex = radialTex([[0, 1], [0.25, 0.55], [0.6, 0.12], [1, 0]]);
+const glowSprite = (c, k) => new THREE.Sprite(new THREE.SpriteMaterial({ map: softTex, color: hdr(c, k), blending: THREE.AdditiveBlending, depthWrite: false, fog: false, toneMapped: false }));
+// floor: near-black, lets 15% of the mirrored pass through; additive light pools on top
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshBasicMaterial({ color: COL.black, transparent: true, opacity: 0.85 }));
+floor.rotation.x = -Math.PI / 2; floorScene.add(floor);
+function floorPool(c) { const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: softTex, color: c.clone(), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false })); m.rotation.x = -Math.PI / 2; m.position.y = 0.002; floorScene.add(m); return m; }
+
+// --- key positions -----------------------------------------------------------------------------
+const P0 = V(0, 2.2, 0);                       // the drop / the point / the burst origin
+const C0 = V(0, 1.5, 9), T0 = V(0, 1.25, 0);    // first-frame camera
+const DIR0 = T0.clone().sub(C0).normalize();
+const CEND = P0.clone().add(C0.clone().sub(P0).multiplyScalar(0.5));   // same ray as frame one, closer
+const M = V(0, 1.25, 0), MED_R = 0.75;          // medallion
+const CF = V(0, 1.45, 9.2), TF = V(0, 1.05, 0); // final locked camera
+const VORTEX_AXIS = CEND.clone().sub(P0).normalize();
+const VX_E1 = V(0, 1, 0).cross(VORTEX_AXIS).normalize(), VX_E2 = VORTEX_AXIS.clone().cross(VX_E1);
+
+// --- camera: Hermite spline through timed keys (zero velocity at "stop" keys) -------------------------
+const CAM = [
+  { t: 0.0, p: C0, l: T0, stop: true },
+  { t: 2.0, p: V(0, 1.9, 7.2), l: V(0, 0.95, 0) },
+  { t: 3.1, p: V(0, 2.5, 9.1), l: V(0, 1.55, 0) },
+  { t: 4.0, p: V(0, 4.6, 7.4), l: V(0, 1.2, 0) },
+  { t: 4.4, p: V(-1.2, 4.2, 6.6), l: V(-0.6, 1.2, 0) },
+  { t: 4.9, p: V(-3.4, 1.55, 4.6), l: V(-0.7, 1.1, 0) },
+  { t: 6.0, p: V(-0.3, 1.45, 4.3), l: V(2.1, 1.0, 0) },
+  { t: 7.0, p: V(2.0, 2.1, 7.2), l: V(2.0, 1.2, 0) },
+  { t: 8.0, p: V(0, 3.0, 16.5), l: V(0, 1.7, -1.5) },
+  { t: 10.0, p: V(0, 2.0, 9.8), l: V(0, 1.15, 0) },
+  { t: 11.2, p: V(0, 2.05, 9.6), l: V(0, 1.9, 0) },
+  { t: HIT.still, p: CEND, l: CEND.clone().addScaledVector(DIR0, CEND.distanceTo(P0)), stop: true },
+  { t: HIT.big, p: CEND, l: CEND.clone().addScaledVector(DIR0, CEND.distanceTo(P0)), stop: true },
+  { t: 13.5, p: CF, l: TF, stop: true },
+  { t: 15.0, p: CF, l: TF, stop: true },
+];
+function hermite(keys, t, f) {
+  if (t <= keys[0].t) return keys[0][f].clone();
+  if (t >= keys.at(-1).t) return keys.at(-1)[f].clone();
+  let i = 0; while (keys[i + 1].t < t) i++;
+  const k0 = keys[i], k1 = keys[i + 1], h = k1.t - k0.t, s = (t - k0.t) / h;
+  const tan = j => { const k = keys[j]; if (k.stop || j === 0 || j === keys.length - 1) return V(0, 0, 0); return keys[j + 1][f].clone().sub(keys[j - 1][f]).divideScalar(keys[j + 1].t - keys[j - 1].t); };
+  const s2 = s * s, s3 = s2 * s;
+  return k0[f].clone().multiplyScalar(2 * s3 - 3 * s2 + 1).add(tan(i).multiplyScalar((s3 - 2 * s2 + s) * h))
+    .add(k1[f].clone().multiplyScalar(-2 * s3 + 3 * s2)).add(tan(i + 1).multiplyScalar((s3 - s2) * h));
+}
+
+// ===================================================================================================
+// ELEMENTS
+// ===================================================================================================
+
+// 1. Drop / point --------------------------------------------------------------------------------------
+const drop = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16), glowMat(COL.accent, 9)); world.add(drop);
+const dropHalo = glowSprite(COL.accent, 2.2); world.add(dropHalo);
+const trailMat = new THREE.ShaderMaterial({
+  uniforms: { uColor: { value: hdr(COL.accent, 5) } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: `varying float vY; void main(){ vY = uv.y; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`,
+  fragmentShader: `uniform vec3 uColor; varying float vY; void main(){ gl_FragColor = vec4(uColor * pow(1.-vY, 2.0), 1.); }`,
+});
+const trail = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 1, 12, 1, true).translate(0, 0.5, 0), trailMat); world.add(trail);
+const DROP_R = 0.032;
+
+// 2. Ripple rings -----------------------------------------------------------------------------------------
+const RINGS = 5, RING_GAP = 0.46, ringR = k => RING_GAP * (k + 1);
+const segN = k => Math.round(Math.PI * 2 * ringR(k) / 0.46);
+const ringMat = new THREE.ShaderMaterial({
+  uniforms: { uColor: { value: hdr(COL.secondary, 2.2) }, uN: { value: 1 }, uGap: { value: 0 }, uOff: { value: 0 }, uK: { value: 1 } },
+  transparent: true, depthWrite: false, side: THREE.DoubleSide,
+  vertexShader: `varying vec2 vP; void main(){ vP = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`,
+  fragmentShader: `uniform vec3 uColor; uniform float uN, uGap, uOff, uK; varying vec2 vP;
+    void main(){ float a = atan(vP.y, vP.x) - uOff; float f = fract(a / 6.2831853 * uN + 0.5);
+      if (abs(f - 0.5) > 0.5 - uGap * 0.5) discard; gl_FragColor = vec4(uColor * uK, 1.); }`,
+});
+const rings = Array.from({ length: RINGS }, () => { const m = new THREE.Mesh(new THREE.BufferGeometry(), ringMat.clone()); m.rotation.x = -Math.PI / 2; m.position.y = 0.004; world.add(m); return m; });
+const flashRing = new THREE.Mesh(new THREE.BufferGeometry(), glowMat(COL.accent, 3)); flashRing.material.transparent = true; flashRing.rotation.x = -Math.PI / 2; flashRing.position.y = 0.005; world.add(flashRing);
+const ringOff = k => k * 0.37;
+
+// 3. Skyline ---------------------------------------------------------------------------------------------------
+const towerGeo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
+const edgeGeo = new THREE.BoxGeometry(0.014, 1, 0.014).translate(0, 0.5, 0);
+const metalMat = new THREE.MeshStandardMaterial({ color: COL.secondary, metalness: 0.92, roughness: 0.34 });
+const glassMat = new THREE.MeshPhysicalMaterial({ color: COL.primary, metalness: 0.1, roughness: 0.16, transparent: true, opacity: 0.62, clearcoat: 1, clearcoatRoughness: 0.2 });
+const towers = [];
+for (let k = 0; k < RINGS; k++) {
+  const n = segN(k), r = ringR(k), rnd = mulberry32(100 + k);
+  for (let j = 0; j < n; j++) {
+    const th = ringOff(k) + j / n * Math.PI * 2;
+    const h = (2.75 - 0.42 * k) * (0.72 + 0.5 * rnd());
+    const w = 2 * r * Math.sin(Math.PI / n) * 0.6;
+    const g = new THREE.Group(); g.position.set(r * Math.cos(th), 0, r * Math.sin(th)); g.rotation.y = -th - Math.PI / 2;
+    const glass = rnd() < 0.42;
+    const body = new THREE.Mesh(towerGeo, glass ? glassMat : metalMat); body.scale.set(w, 1, 0.13); g.add(body);
+    const eL = new THREE.Mesh(edgeGeo, glowMat(COL.accent, 0.7)), eR = new THREE.Mesh(edgeGeo, eL.material);
+    eL.position.set(-w / 2, 0, 0.066); eR.position.set(w / 2, 0, 0.066); g.add(eL, eR);
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.09, 0.022), glowMat(COL.accent, 5)); g.add(head);
+    world.add(g);
+    towers.push({ g, body, eL, eR, head, k, j, n, th, h, w, rise0: HIT.sky + (RINGS - 1 - k) * 0.3 + j / n * 0.22 });
+  }
+}
+const towerTop = (k, th) => { // height of the tower under a spiral point
+  const n = segN(k); let j = Math.round((th - ringOff(k)) / (Math.PI * 2) * n); j = ((j % n) + n) % n;
+  return towers.find(o => o.k === k && o.j === j).h;
+};
+
+// 4. Ribbon -> line -> ridge ---------------------------------------------------------------------------------------
+const ribbonMat = glowMat(COL.accent, 3.2);
+const ribbon = new THREE.Mesh(new THREE.BufferGeometry(), ribbonMat); world.add(ribbon);
+const RIB_R = 0.018, LINE_Y = 1.15, X0 = -5, X1 = 5;
+const headX = t => -1.6 + 2.36 * (t - 4.6);                 // the line's leading edge, constant speed
+const DIP = { a: headX(HIT.dip), b: headX(HIT.dip + 0.35), c: headX(HIT.dip + 0.85), d: headX(HIT.dip + 1.3) };
+const lineY = x => { // flat, dip, hold, recover (never above the start level)
+  const s = v => v * v * (3 - 2 * v);
+  const d = x < DIP.a ? 0 : x < DIP.b ? s((x - DIP.a) / (DIP.b - DIP.a)) : x < DIP.c ? 1 : x < DIP.d ? 1 - s((x - DIP.c) / (DIP.d - DIP.c)) : 0;
+  return LINE_Y - 0.5 * d;
+};
+function spiralPt(u) {
+  const kf = (RINGS - 1) * (1 - u), r = RING_GAP * (kf + 1), th = u * Math.PI * 2 * 2.5;
+  const k0 = Math.floor(kf), k1 = Math.min(RINGS - 1, k0 + 1), f = kf - k0;
+  const y = lerp(towerTop(k0, th), towerTop(k1, th), f) + 0.03;
+  return V(r * Math.cos(th), y, r * Math.sin(th));
+}
+// smoothed spiral samples (tower tops vary; low-pass the height so the ribbon flows)
+const SPIRAL = (() => { const n = 400, raw = Array.from({ length: n + 1 }, (_, i) => spiralPt(i / n)); return raw.map((p, i) => { let y = 0, c = 0; for (let k = -18; k <= 18; k++) { const q = raw[clamp(i + k, 0, n)]; y += q.y; c++; } return V(p.x, y / c, p.z); }); })();
+const spiralAt = u => { const f = u * (SPIRAL.length - 1), i = Math.floor(f), j = Math.min(SPIRAL.length - 1, i + 1); return SPIRAL[i].clone().lerp(SPIRAL[j], f - i); };
+
+// Himalayan ridge profiles (sharp peaks, seeded detail)
+function ridgeProfile(seed, peaks, base, detail) {
+  const rnd = mulberry32(seed), D = Array.from({ length: 200 }, () => rnd() - 0.5);
+  return x => {
+    let y = base; for (const [c, h, w] of peaks) y = Math.max(y, h * (1 - Math.abs(x - c) / w));
+    const f = (x + 10) / 0.17, i = Math.floor(f); const n = lerp(D[i % 200], D[(i + 1) % 200], f - i);
+    return y + n * detail * (0.4 + y / 3);
+  };
+}
+const ridgeY = ridgeProfile(7, [[0, 2.35, 1.6], [-2.6, 1.6, 1.3], [2.2, 1.75, 1.4], [-4.1, 1.0, 1.1], [4.0, 1.1, 1.2]], 0.28, 0.12);
+const backY = [
+  ridgeProfile(11, [[0.3, 2.9, 2.1], [-3.0, 2.2, 1.8], [3.4, 2.4, 1.9], [-5.6, 1.4, 1.6], [6.0, 1.5, 1.6]], 0.5, 0.16),
+  ridgeProfile(12, [[-1.4, 3.3, 2.2], [2.4, 3.0, 2.0], [-5.0, 2.2, 2.0], [5.8, 2.0, 2.0]], 0.7, 0.18),
+  ridgeProfile(13, [[0.9, 3.7, 2.6], [-3.4, 3.1, 2.3], [4.6, 2.9, 2.2], [-7, 2, 2.5]], 0.9, 0.2),
+];
+// ridge body morph: the line thickens left-to-right, profile turns from line into peaks
+const ridgeM = (x, t) => eInOut(seg(t, 7.0 + (x - X0) * 0.04, 7.6 + (x - X0) * 0.04));
+const topY = (x, t) => lerp(lineY(x), ridgeY(x), ridgeM(x, t));
+
+const PANELS = 10, PW = (X1 - X0) / PANELS;
+const ridgeMat = new THREE.MeshStandardMaterial({ color: COL.secondary, metalness: 0.35, roughness: 0.55 });
+const panels = Array.from({ length: PANELS }, (_, i) => {
+  const pivot = new THREE.Group(), g = new THREE.Group(), body = new THREE.Mesh(new THREE.BufferGeometry(), ridgeMat), crest = new THREE.Mesh(new THREE.BufferGeometry(), ribbonMat);
+  g.add(body, crest); pivot.add(g); world.add(pivot); return { i, pivot, g, body, crest };
+});
+const backMats = [0.75, 0.55, 0.4].map(k => new THREE.MeshStandardMaterial({ color: COL.primary.clone().lerp(COL.secondary, k * 0.6), metalness: 0.3, roughness: 0.6 }));
+const backs = backY.map((f, l) => {
+  const pts = [V(-8, 0, 0)]; for (let x = -8; x <= 8.001; x += 0.08) pts.push(V(x, f(x), 0)); pts.push(V(8, 0, 0));
+  const m = new THREE.Mesh(new THREE.ExtrudeGeometry(new THREE.Shape(pts.map(p => new THREE.Vector2(p.x, p.y))), { depth: 0.3, bevelEnabled: false }), backMats[l]);
+  m.position.z = -1.7 * (l + 1); world.add(m); return m;
+});
+const sun = glowSprite(COL.accent, 9); world.add(sun);
+const sunCore = new THREE.Mesh(new THREE.SphereGeometry(0.16, 24, 16), glowMat(COL.accent, 14)); world.add(sunCore);
+
+// 5. Arch (folded ridge) + home -----------------------------------------------------------------------------------
+const ARCH_R = 2.0, FACET = 2 * ARCH_R * Math.sin(Math.PI / PANELS / 2), BAND = 0.38;
+const homePts = [V(-0.45, 0, 0), V(-0.45, 0.62, 0), V(0, 1.05, 0), V(0.45, 0.62, 0), V(0.45, 0, 0), V(-0.45, 0, 0)];
+const homeMat = glowMat(COL.white, 1.6);
+const home = new THREE.Mesh(new THREE.BufferGeometry(), homeMat);
+const win = new THREE.Mesh(new THREE.PlaneGeometry(0.2, 0.2), glowMat(COL.accent, 6));
+win.position.set(0, 0.42, 0.01);
+const winGlow = glowSprite(COL.accent, 1.4); winGlow.position.copy(win.position); winGlow.scale.setScalar(0.9);
+const homePivot = new THREE.Group(), homeG = new THREE.Group(); homeG.add(home, win, winGlow); homePivot.add(homeG); world.add(homePivot);
+
+// 6. Vortex ghosts (one of every form seen so far) -------------------------------------------------------------------
+const ghosts = [];
+{
+  const add = (obj, ang, rad) => { const pivot = new THREE.Group(); pivot.add(obj); world.add(pivot); ghosts.push({ pivot, obj, ang, rad }); };
+  for (let k = 0; k < 3; k++) add(new THREE.Mesh(new THREE.TorusGeometry(0.22 + k * 0.12, 0.008, 6, 96), glowMat(COL.secondary, 1.8)), k * 0.3, 2.6);
+  for (let k = 0; k < 5; k++) { const m = new THREE.Mesh(towerGeo, k % 2 ? glassMat : metalMat); m.scale.set(0.07, 0.35 + 0.15 * k, 0.07); add(m, 1.4 + k * 0.22, 2.4); }
+  { const pts = Array.from({ length: 40 }, (_, i) => V(i / 39 - 0.5, -0.15 * Math.sin(i / 39 * Math.PI) * (i > 15 && i < 30 ? 1 : 0.2), 0));
+    add(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 60, 0.012, 6), glowMat(COL.accent, 4)), 3.0, 2.2); }
+  { const pts = [new THREE.Vector2(-0.6, 0)]; for (let x = -0.6; x <= 0.6; x += 0.02) pts.push(new THREE.Vector2(x, ridgeY(x * 7) / 7)); pts.push(new THREE.Vector2(0.6, 0));
+    add(new THREE.Mesh(new THREE.ExtrudeGeometry(new THREE.Shape(pts), { depth: 0.04, bevelEnabled: false }), ridgeMat), 4.2, 2.5); }
+  for (let k = 0; k < 2; k++) add(new THREE.Mesh(new THREE.SphereGeometry(0.02, 12, 8), glowMat(COL.accent, 8)), 5.2 + k * 0.5, 1.6);
+}
+
+// 7. Burst: shockwave, filaments, medallion ------------------------------------------------------------------------------
+const shock = new THREE.Mesh(new THREE.BufferGeometry(), glowMat(COL.accent, 4)); world.add(shock);
+const FIL = 140, filGeo = new THREE.BoxGeometry(1, 0.006, 0.006).translate(0.5, 0, 0);
+const burstG = new THREE.Group(); world.add(burstG);
+const filaments = Array.from({ length: FIL }, (_, i) => { const r = mulberry32(900 + i); const m = new THREE.Mesh(filGeo, glowMat(COL.accent, 3 + 4 * r())); burstG.add(m); return { m, a: i / FIL * Math.PI * 2 + r() * 0.02, s: 0.7 + 0.6 * r(), l: 0.25 + 0.5 * r() }; });
+const medal = new THREE.Group(); world.add(medal);
+const brushedTex = (() => { // concentric satin brushing as a roughness map
+  const c = document.createElement('canvas'); c.width = c.height = 1024; const g = c.getContext('2d'), rnd = mulberry32(5);
+  g.fillStyle = '#808080'; g.fillRect(0, 0, 1024, 1024);
+  for (let r = 4; r < 512; r += 1.5) { const v = 110 + rnd() * 50; g.strokeStyle = `rgb(${v},${v},${v})`; g.lineWidth = 1; g.beginPath(); g.arc(512, 512, r, 0, Math.PI * 2); g.stroke(); }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.NoColorSpace; return t;
+})();
+const medalMat = new THREE.MeshStandardMaterial({ color: COL.primary, metalness: 0.7, roughness: 0.3, roughnessMap: brushedTex });
+const medalKey = new THREE.PointLight(COL.white, 0, 12, 1.2); world.add(medalKey);
+const disc = new THREE.Mesh(new THREE.CylinderGeometry(MED_R, MED_R, 0.07, 160, 1), medalMat); disc.rotation.x = Math.PI / 2; medal.add(disc);
+const bevel = new THREE.Mesh(new THREE.TorusGeometry(MED_R, 0.035, 24, 200), new THREE.MeshStandardMaterial({ color: COL.primary, metalness: 1, roughness: 0.25 })); medal.add(bevel);
+const rimGlow = new THREE.Mesh(new THREE.TorusGeometry(MED_R + 0.026, 0.0065, 12, 256), glowMat(COL.accent, 2)); rimGlow.position.z = 0.02; medal.add(rimGlow);
+const sweepMat = new THREE.ShaderMaterial({
+  uniforms: { uX: { value: -2 }, uColor: { value: hdr(COL.white, 0.45) }, uTint: { value: hdr(COL.accent, 0.32) } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: `varying vec2 vP; void main(){ vP = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`,
+  fragmentShader: `uniform float uX; uniform vec3 uColor, uTint; varying vec2 vP;
+    void main(){ float d = vP.x + vP.y * 0.35 - uX; float band = exp(-d*d*28.) ; float core = exp(-d*d*400.);
+      float r = length(vP) / ${MED_R.toFixed(3)}; float face = smoothstep(1.0, 0.985, r);
+      gl_FragColor = vec4((uTint * band + uColor * core) * face, 1.); }`,
+});
+const sweep = new THREE.Mesh(new THREE.CircleGeometry(MED_R, 160), sweepMat); sweep.position.z = 0.037; medal.add(sweep);
+// resting satin sheen: a soft static gradient from the key side, so the held frame is not a flat disc
+const sheen = new THREE.Mesh(new THREE.CircleGeometry(MED_R, 160), new THREE.ShaderMaterial({
+  uniforms: { uColor: { value: hdr(COL.white, 0.07) }, uK: { value: 0 } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: `varying vec2 vP; void main(){ vP = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`,
+  fragmentShader: `uniform vec3 uColor; uniform float uK; varying vec2 vP;
+    void main(){ float g = smoothstep(0.9, -0.6, dot(vP / ${MED_R.toFixed(3)}, normalize(vec2(1., -0.8))));
+      float ring = 0.5 + 0.5 * sin(length(vP) * 260.); float face = smoothstep(1.0, 0.98, length(vP) / ${MED_R.toFixed(3)});
+      gl_FragColor = vec4(uColor * uK * g * g * (0.8 + 0.2 * ring) * face, 1.); }`,
+})); sheen.position.z = 0.0365; medal.add(sheen);
+const medalPool = floorPool(hdr(COL.accent, 0.35));
+const heroPool = floorPool(hdr(COL.accent, 0.5));
+
+// branded variant: the real mark inlaid on the medallion face (reversed for a dark plate)
+const brandMark = new THREE.Group(); medal.add(brandMark);
+{
+  const PIECES = [
+    { c: COL.secondary, pts: [[202,132],[307,237],[307,405],[202,405]] },
+    { c: COL.white,     pts: [[202,132],[473,132],[473,237],[307,237]] },
+    { c: COL.accent,    pts: [[307,237],[473,237],[473,405]] },
+    { c: new THREE.Color('#DA7B5E'), pts: [[307,237],[307,405],[473,405]] },
+    { c: COL.secondary, pts: [[202,449],[307,449],[307,535],[202,640]] },
+    { c: COL.white,     pts: [[518,132],[708,132],[604,237],[518,237]] },
+  ];
+  const s = MED_R * 1.12 / 508, cx = 455, cy = 386;
+  PIECES.forEach(p => {
+    const shape = new THREE.Shape(p.pts.map(([x, y]) => new THREE.Vector2((x - cx) * s, -(y - cy) * s)));
+    const m = new THREE.Mesh(new THREE.ExtrudeGeometry(shape, { depth: 0.012, bevelEnabled: true, bevelThickness: 0.003, bevelSize: 0.003, bevelSegments: 1 }),
+      new THREE.MeshStandardMaterial({ color: p.c, metalness: 0.55, roughness: 0.38 }));
+    m.position.z = 0.036; brandMark.add(m);
+  });
+}
+
+// 8. Particles (CPU-evaluated from seeded parameters; drawn as soft points) ------------------------------------------------
+const MAXP = 24000;
+const pGeo = new THREE.BufferGeometry();
+const pPos = new Float32Array(MAXP * 3), pCol = new Float32Array(MAXP * 3), pSize = new Float32Array(MAXP);
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3)); pGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3)); pGeo.setAttribute('size', new THREE.BufferAttribute(pSize, 1));
+const pMat = new THREE.ShaderMaterial({
+  uniforms: { uScale: { value: H / (2 * Math.tan(THREE.MathUtils.degToRad(22.9 / 2))) }, uFocus: { value: 10 }, uAperture: { value: 0.012 } },
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, clipping: true,
+  vertexShader: `attribute float size; attribute vec3 color; varying vec3 vC; varying float vA; uniform float uScale, uFocus, uAperture;
+    #include <clipping_planes_pars_vertex>
+    void main(){ vec4 mvPosition = modelViewMatrix * vec4(position,1.); float d = -mvPosition.z;
+      float coc = abs(d - uFocus) / d * uAperture * uScale;                 // circle of confusion (px)
+      float px = size * uScale / d; float s = max(1.5, px + coc);
+      vA = clamp(px * px / (s * s), 0.02, 1.) ; vC = color; gl_PointSize = s * 2.;
+      gl_Position = projectionMatrix * mvPosition;
+      #include <clipping_planes_vertex>
+    }`,
+  fragmentShader: `varying vec3 vC; varying float vA;
+    #include <clipping_planes_pars_fragment>
+    void main(){
+      #include <clipping_planes_fragment>
+      float r = length(gl_PointCoord - .5) * 2.; if (r > 1.) discard; float a = smoothstep(1., .35, r);
+      gl_FragColor = vec4(vC * a * vA, 1.); }`,
+});
+const points = new THREE.Points(pGeo, pMat); points.frustumCulled = false; world.add(points);
+const PSETS = (() => {
+  const r = mulberry32(2024), mk = (n, f) => Array.from({ length: n }, (_, i) => f(i, r));
+  return {
+    splash: mk(48, (i, r) => ({ a: r() * Math.PI * 2, v: 0.6 + r() * 0.9, up: 1.4 + r() * 1.6, s: 0.006 + r() * 0.006 })),
+    lineDust: mk(500, (i, r) => ({ p: V(lerp(-7, 7, r()), lerp(0.1, 2.6, r()), lerp(-4, 2.6, r())), s: 0.004 + r() ** 3 * 0.012, ph: r() * 6.28, warm: r() })),
+    dust: mk(1500, (i, r) => ({ p: V(lerp(-7, 7, r()), lerp(0.2, 4.2, r() ** 1.4), lerp(-5.5, 1.5, r())), d: V(r() - 0.5, r() * 0.4 - 0.1, r() - 0.5).multiplyScalar(0.12), s: 0.004 + r() ** 3 * 0.02, w: 0.6 + r() * 1.2, warm: r() })),
+    burst: mk(2400, (i, r) => { const a = r() * Math.PI * 2, z = r() - 0.5; return { a, z, v: 1.6 + r() * 3.2, s: 0.004 + r() ** 2 * 0.012, onRim: r() < 0.55, ta: r() * Math.PI * 2, tr: Math.sqrt(r()), settle: r() < 0.05, sx: (r() - 0.5) * 6, sy: 0.05 + r() * 0.5, sz: (r() - 0.5) * 3, warm: r() }; }),
+  };
+})();
+
+// --- vortex transform: rotate about the view axis through P0 and scale toward it -----------------------------------------
+const vortexP = t => Math.pow(seg(t, HIT.arch + 0.3, HIT.collapse + 0.2), 1.5);      // 0 -> 1 squeeze
+const vortexA = (t, w) => w * 10 * Math.pow(seg(t, HIT.arch + 0.25, HIT.collapse + 0.2), 2);
+// the swirl turns about the arch's centre, and that centre glides up into P0 as everything shrinks
+const VC = V(0, 1.0, 0);
+const vortexC = t => VC.clone().lerp(P0, eInOut(seg(t, HIT.arch + 0.3, HIT.collapse + 0.2)));
+function vortexPivot(pivot, t, w) {
+  pivot.position.copy(vortexC(t)); pivot.quaternion.setFromAxisAngle(VORTEX_AXIS, vortexA(t, w)); pivot.scale.setScalar(Math.max(1e-4, 1 - vortexP(t)));
+}
+const _q = new THREE.Quaternion();
+function vortexPoint(v, t, w) { _q.setFromAxisAngle(VORTEX_AXIS, vortexA(t, w)); return v.sub(VC).applyQuaternion(_q).multiplyScalar(1 - vortexP(t)).add(vortexC(t)); }
+
+// --- geometry helpers ------------------------------------------------------------------------------------------------------
+function setGeo(mesh, geo) { mesh.geometry.dispose(); mesh.geometry = geo; }
+function tube(pts, r, segs = 200) { return pts.length < 2 ? new THREE.BufferGeometry() : new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts, false, 'centripetal'), segs, r, 8, false); }
+function polylinePartial(pts, p) { // the first p (0..1) of a polyline by length
+  const L = [0]; for (let i = 1; i < pts.length; i++) L.push(L[i - 1] + pts[i].distanceTo(pts[i - 1]));
+  const target = L.at(-1) * p, out = [pts[0].clone()];
+  for (let i = 1; i < pts.length; i++) { if (L[i] <= target) out.push(pts[i].clone()); else { out.push(pts[i - 1].clone().lerp(pts[i], (target - L[i - 1]) / (L[i] - L[i - 1]))); break; } }
+  return out;
+}
+// densify a polyline so corners stay crisp under the spline
+const densify = pts => pts.flatMap((p, i) => i ? Array.from({ length: 8 }, (_, k) => pts[i - 1].clone().lerp(p, (k + 1) / 8)) : [p.clone()]);
+
+// ===================================================================================================
+// STATE AT TIME t (pure)
+// ===================================================================================================
+function update(t, slice = 0) {   // slice: this sub-frame's share of the shutter (fast particles fill it)
+  // camera
+  camera.position.copy(hermite(CAM, t, 'p')); camera.lookAt(hermite(CAM, t, 'l')); camera.updateMatrixWorld();
+  const focusPt = hermite(CAM, t, 'l');
+
+  // ---- drop: still at frame 0, falls with gravity, lands on HIT 1 ----
+  const fall = seg(t, 0, HIT.drop), dropOn = t < HIT.drop + 0.02;
+  const dy = P0.y * (1 - fall * fall);
+  const pointOn = t >= HIT.collapse - 0.25 && t < HIT.big + 0.02;
+  drop.visible = dropOn || pointOn; dropHalo.visible = drop.visible;
+  heroLight.intensity = 0; heroPool.visible = false;
+  if (dropOn) {
+    drop.position.set(0, dy, 0); drop.scale.setScalar(DROP_R);
+    dropHalo.position.copy(drop.position); dropHalo.scale.setScalar(0.22);
+    heroLight.position.copy(drop.position); heroLight.intensity = 3;
+    const v = 2 * P0.y * fall / HIT.drop;                     // speed -> trail length
+    trail.visible = fall > 0; trail.position.set(0, dy, 0); trail.scale.set(DROP_R * 0.45, Math.min(dy, v * 0.09), DROP_R * 0.45);
+  } else trail.visible = false;
+  if (pointOn) { // everything compressed into one point, same screen size/position as frame one
+    const k = seg(t, HIT.collapse - 0.25, HIT.collapse + 0.2);
+    const d = camera.position.distanceTo(P0) / C0.distanceTo(P0);
+    drop.position.copy(P0); drop.scale.setScalar(DROP_R * d * lerp(3, 1, eOut3(k)));
+    drop.material.color.copy(hdr(COL.accent, lerp(22, 12, k)));
+    dropHalo.position.copy(P0); dropHalo.scale.setScalar(0.22 * d * lerp(2.2, 1.1, k));
+  } else drop.material.color.copy(hdr(COL.accent, 9));
+
+  // ---- ripple rings (HIT 1), break into segments (HIT 2) ----
+  const ringVis = t >= HIT.drop && t < HIT.line + 0.7;
+  rings.forEach((m, k) => {
+    m.visible = ringVis; if (!ringVis) return;
+    const t0 = HIT.drop + k * 0.13, p = eOut3(seg(t, t0, t0 + 1.15));
+    if (p <= 0) { m.visible = false; return; }
+    const r = ringR(k) * p, w = 0.024;
+    setGeo(m, new THREE.RingGeometry(Math.max(0.001, r - w / 2), r + w / 2, 160, 1));
+    const u = m.material.uniforms; u.uN.value = segN(k); u.uOff.value = ringOff(k);
+    u.uGap.value = 0.38 * eOut3(seg(t, HIT.sky - 0.04, HIT.sky + 0.3));
+    u.uK.value = lerp(1, 0.45, seg(t, HIT.sky, HIT.sky + 1.6)) * (1 - seg(t, HIT.line, HIT.line + 0.6)) * (0.6 + 0.4 * eOut3(seg(t, t0, t0 + 0.3)));
+  });
+  { const p = seg(t, HIT.drop, HIT.drop + 0.7); flashRing.visible = p > 0 && p < 1;
+    if (flashRing.visible) { const r = 0.05 + 3.6 * eOut3(p), w = 0.05 * (1 - p) + 0.004; setGeo(flashRing, new THREE.RingGeometry(r, r + w, 160, 1)); flashRing.material.color.copy(hdr(COL.accent, 4 * (1 - p) ** 2)); } }
+  if (t >= HIT.drop && t < HIT.drop + 0.9) { heroPool.visible = true; heroPool.position.set(0, 0.002, 0); const p = seg(t, HIT.drop, HIT.drop + 0.9); heroPool.scale.setScalar(0.5 + 2.5 * p); heroPool.material.color.copy(hdr(COL.accent, 0.8 * (1 - p))); }
+
+  // ---- skyline (HIT 2) and melt (HIT 3) ----
+  for (const o of towers) {
+    const rise = eSettle(seg(t, o.rise0, o.rise0 + 0.8));
+    const melt = eIn3(seg(t, HIT.line + 0.3 + o.k * 0.1, HIT.line + 0.95 + o.k * 0.1));
+    const h = o.h * rise * (1 - melt);
+    o.g.visible = h > 0.002;
+    if (!o.g.visible) continue;
+    o.body.scale.y = h;
+    const run = seg(t, o.rise0, o.rise0 + 0.75);                // accent light runs up the edges
+    o.eL.scale.y = o.eR.scale.y = Math.max(1e-3, h * eOut3(run));
+    o.head.visible = run > 0 && run < 1; o.head.position.set(-o.w / 2, h * eOut3(run), 0.066);
+  }
+
+  // ---- ribbon: spiral over the tops (HIT 3) -> line -> dip (HIT 4) -> crest ----
+  ribbon.visible = t >= HIT.line && t < 7.0;
+  if (ribbon.visible) {
+    const draw = eInOut(seg(t, HIT.line, HIT.line + 0.45)), xh = Math.max(-1.6, headX(t)), pts = [];
+    const n = 240;
+    for (let i = 0; i <= n; i++) {
+      const u = i / n * draw;
+      const m = eInOut(seg(t, HIT.line + 0.35 + 0.55 * u, HIT.line + 0.95 + 0.55 * u));
+      const x = X0 + u * (xh - X0);
+      pts.push(spiralAt(u).lerp(V(x, lineY(x), 0), m));
+    }
+    setGeo(ribbon, tube(pts, RIB_R, 400));
+  }
+
+  // ---- ridge panels: body + crest; lift and fold into an arch (8 -> 10) ----
+  const ridgeOn = t >= 7.0;
+  const xh = Math.min(X1, headX(t));
+  for (const P of panels) {
+    P.pivot.visible = ridgeOn; if (!ridgeOn) continue;
+    const xa = X0 + P.i * PW, xb = Math.min(xa + PW, xh);
+    if (xb - xa < 0.01) { P.pivot.visible = false; continue; }
+    // shape in panel-local coordinates (x from 0)
+    const tops = [], bots = [];
+    for (let k = 0; k <= 30; k++) { const x = lerp(xa, xb, k / 30), y = topY(x, Math.min(t, 8.0)), m = ridgeM(x, Math.min(t, 8.0)); tops.push(new THREE.Vector2(x - xa, y)); bots.push(new THREE.Vector2(x - xa, y * (1 - m))); }
+    const thick = Math.max(...tops.map((p, k) => p.y - bots[k].y));
+    if (thick > 0.004) setGeo(P.body, new THREE.ExtrudeGeometry(new THREE.Shape([...tops, ...bots.reverse()]), { depth: 0.3, bevelEnabled: false, curveSegments: 1 }));
+    P.body.visible = thick > 0.004; P.body.position.z = -0.15;
+    setGeo(P.crest, tube(tops.map(p => V(p.x, p.y, 0)), RIB_R, 60));
+    // fold pose: flat -> arch facet (outer panels fold first, the centre lands on HIT 6)
+    const d = Math.abs(P.i - (PANELS - 1) / 2), start = HIT.arch - 0.75 - (d - 0.5) * 0.16;
+    const f = eInOut(seg(t, start, start + 0.75)), lift = 0.35 * eInOut(seg(t, 8.2, 8.7)) * (1 - f);
+    const a0 = Math.PI - Math.PI * P.i / PANELS, a1 = Math.PI - Math.PI * (P.i + 1) / PANELS;
+    const archPos = V(ARCH_R * Math.cos(a0), ARCH_R * Math.sin(a0), 0), phi = (a0 + a1) / 2 - Math.PI / 2;
+    P.g.position.copy(V(xa, lift, 0).lerp(archPos, f)).sub(VC);
+    P.g.rotation.set(0.55 * Math.sin(Math.PI * f) * (P.i < PANELS / 2 ? 1 : -1), 0, lerp(0, phi, f), 'ZXY');
+    P.g.scale.set(lerp(1, FACET / PW, f), lerp(1, BAND, f), 1);
+    vortexPivot(P.pivot, t, 1 + 0.05 * P.i);
+  }
+  // back ranges rise for the sunrise, sink as the ridge folds
+  backs.forEach((m, l) => { const up = eOut3(seg(t, 7.35 + l * 0.12, 8.05 + l * 0.08)), down = eIn3(seg(t, 8.6 + l * 0.1, 9.4 + l * 0.1)); m.visible = up > 0 && down < 1; m.position.y = -4.5 * (1 - up) - 4.5 * down; });
+  // sunrise behind the tallest back peak, flaring on HIT 5
+  { const up = eOut3(seg(t, 7.5, HIT.sun + 0.15)), down = seg(t, 8.7, 9.6); sun.visible = sunCore.visible = up > 0 && down < 1;
+    const y = lerp(1.8, 4.05, up) - down * 1.5; sun.position.set(0.9, y, -6.6); sunCore.position.copy(sun.position);
+    const flare = 1 + 1.6 * Math.exp(-Math.max(0, t - HIT.sun) * 2.5) * (t >= HIT.sun ? 1 : 0);
+    sun.scale.setScalar(1.5 * flare); sun.material.color.copy(hdr(COL.accent, 5 * flare * (1 - down)));
+    sunCore.material.color.copy(hdr(COL.accent, 16 * flare * (1 - down)));
+    sunLight.intensity = 3.5 * up * (1 - down); }
+
+  // ---- home: outline draws in, window lights, arch closes over it (HIT 6) ----
+  const homeOn = t >= HIT.arch - 0.8;
+  homePivot.visible = homeOn;
+  if (homeOn) {
+    const draw = eInOut(seg(t, HIT.arch - 0.8, HIT.arch - 0.1));
+    setGeo(home, tube(polylinePartial(densify(homePts), draw), 0.011, 220));
+    homeG.position.copy(VC).negate();
+    const lit = eOut3(seg(t, HIT.arch - 0.25, HIT.arch + 0.1));
+    win.scale.setScalar(Math.max(1e-3, lit)); winGlow.scale.setScalar(0.9 * lit + 1e-3);
+    vortexPivot(homePivot, t, 1.25);
+    if (t < HIT.arch + 1.2) { heroLight.position.set(0, 0.6, 0.6); heroLight.intensity = 2.5 * lit * (1 - vortexP(t)); heroPool.visible = true; heroPool.position.set(0, 0.002, 0.2); heroPool.scale.setScalar(2.6); heroPool.material.color.copy(hdr(COL.accent, 0.45 * lit * (1 - vortexP(t)))); }
+  }
+
+  // ---- ghosts join the vortex ----
+  for (const [i, g] of ghosts.entries()) {
+    const on = t >= HIT.arch + 0.3 && t < HIT.still;
+    g.pivot.visible = on; if (!on) continue;
+    const pop = eSettle(seg(t, HIT.arch + 0.3 + i * 0.03, HIT.arch + 0.65 + i * 0.03));
+    // orbit position in the plane facing the camera, then swirl about the view axis
+    g.obj.position.copy(VX_E1).multiplyScalar(Math.cos(g.ang) * g.rad).addScaledVector(VX_E2, Math.sin(g.ang) * g.rad);
+    g.obj.quaternion.setFromUnitVectors(V(0, 0, 1), VORTEX_AXIS); g.obj.rotateZ(t * 0.6 + i);
+    g.obj.scale.setScalar(Math.max(1e-3, pop));
+    g.pivot.position.copy(vortexC(t)); g.pivot.quaternion.setFromAxisAngle(VORTEX_AXIS, vortexA(t, 1.4 + 0.08 * i) + 0.6 * (t - HIT.arch));
+    g.pivot.scale.setScalar(Math.max(1e-4, 1 - vortexP(t)));
+  }
+
+  // ---- big hit: shockwave, filaments out and back, medallion snaps on the beat ----
+  const bt = t - HIT.big;
+  const center = P0.clone().lerp(M, eInOut(seg(t, HIT.big, HIT.snap)));
+  const face = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().lookAt(CF, M, V(0, 1, 0)));
+  shock.visible = bt >= 0 && bt < 0.5;
+  if (shock.visible) { const p = bt / 0.5, r = 0.05 + 4.5 * eOut3(p); setGeo(shock, new THREE.RingGeometry(r, r + 0.03 * (1 - p) + 0.003, 200, 1)); shock.position.copy(center); shock.quaternion.copy(face); shock.material.color.copy(hdr(COL.accent, 5 * (1 - p) ** 2)); }
+  burstG.visible = bt >= 0 && t < HIT.snap + 0.12;
+  if (burstG.visible) {
+    burstG.position.copy(center); burstG.quaternion.copy(face);
+    const tOut = HIT.big + 0.22, tIn = HIT.snap;
+    for (const f of filaments) {
+      const out = eExpo(seg(t, HIT.big, tOut)), back = eIn3(seg(t, tOut, tIn));
+      const rOuter = lerp(MED_R * 0.2, (2.6 + 1.6 * f.s), out), rr = lerp(rOuter, MED_R + 0.026, back);
+      const len = lerp(f.l * (0.3 + out), 0.002, back);
+      f.m.position.set(Math.cos(f.a) * (rr - len), Math.sin(f.a) * (rr - len), 0); f.m.rotation.z = f.a; f.m.scale.x = len;
+      f.m.visible = t < tIn + 0.1;
+    }
+  }
+  medal.visible = t >= HIT.big + 0.18;
+  if (medal.visible) {
+    medal.position.copy(M); medal.quaternion.copy(face);
+    medalKey.position.set(M.x - 0.9, M.y + 1.1, M.z + 1.3); medalKey.intensity = 7 * eOut3(seg(t, HIT.big + 0.2, HIT.snap));
+    const s = eIn3(seg(t, HIT.big + 0.18, HIT.snap));          // accelerates in, stops dead on the beat
+    medal.scale.setScalar(Math.max(1e-3, s));
+    const breathe = t > 13.5 ? 1 + 0.06 * Math.sin((t - 13.5) / 1.5 * Math.PI * 2) : 1;
+    const snapFlash = t >= HIT.snap ? 1 + 2.2 * Math.exp(-(t - HIT.snap) * 9) : 0.8;
+    rimGlow.material.color.copy(hdr(COL.accent, 1.6 * snapFlash * breathe));
+    sweepMat.uniforms.uX.value = lerp(-1.4, 1.4, eInOut(seg(t, HIT.snap + 0.05, HIT.snap + 0.55)));
+    sweep.visible = t > HIT.snap && t < HIT.snap + 0.6;
+    sheen.material.uniforms.uK.value = eOut3(seg(t, HIT.snap + 0.25, HIT.snap + 0.55)) * breathe;
+    medalPool.visible = true; medalPool.position.set(M.x, 0.002, M.z + 0.2); medalPool.scale.set(2.6 * s, 1.4 * s, 1);
+    medalPool.material.color.copy(hdr(COL.accent, 0.3 * breathe * s));
+  } else medalPool.visible = false;
+
+  // ---- particles ----
+  let n = 0;
+  const putP = (p, c, k, s) => { pPos[n * 3] = p.x; pPos[n * 3 + 1] = p.y; pPos[n * 3 + 2] = p.z; pCol[n * 3] = c.r * k; pCol[n * 3 + 1] = c.g * k; pCol[n * 3 + 2] = c.b * k; pSize[n] = s; n++; };
+  const SUB = slice > 0 ? 6 : 1, subT = j => t + slice * ((j + 0.5) / SUB - 0.5);   // in-slice samples for fast particles
+  if (t >= HIT.drop && t < HIT.drop + 1.2) for (const q of PSETS.splash) for (let j = 0; j < SUB; j++) { // splash crown, ballistic
+    const x = subT(j) - HIT.drop, y = q.up * 0.35 * x - 4.9 * x * x * 0.5; if (y < 0 || x < 0) continue;
+    putP(V(Math.cos(q.a) * q.v * x * 0.5, y, Math.sin(q.a) * q.v * x * 0.5), COL.accent, 6 / SUB, q.s);
+  }
+  if (t >= HIT.line && t < 8.4) for (const q of PSETS.lineDust) {
+    const k = eOut3(seg(t, HIT.line, HIT.line + 0.8)) * (1 - seg(t, 7.6, 8.4));
+    const p = q.p.clone(); p.y += 0.05 * Math.sin(t * 0.7 + q.ph); p.x += 0.08 * Math.sin(t * 0.4 + q.ph);
+    putP(p, q.warm > 0.7 ? COL.accent : COL.white, 0.5 * k, q.s);
+  }
+  if (t >= 7.4 && t < HIT.still) for (const [i, q] of PSETS.dust.entries()) { // dust in the sunrise, then into the vortex
+    const age = t - 7.4, p = q.p.clone().addScaledVector(q.d, age * (1 + 0.3 * Math.sin(age * q.w + i)));
+    p.y += 0.04 * Math.sin(age * q.w * 1.3 + i * 0.7);
+    const sunK = Math.exp(-((p.x - 0.9) ** 2 + (p.y - 3.4) ** 2) / 10) * (sun.visible ? sun.material.color.r / 5 : 0);
+    const appear = eOut3(seg(t, 7.4 + (i % 50) * 0.01, 7.9 + (i % 50) * 0.01));
+    vortexPoint(p, t, 0.9 + 0.5 * q.warm);
+    putP(p, q.warm > 0.6 ? COL.accent : COL.white, appear * (0.25 + 2.2 * sunK + 1.5 * vortexP(t)), q.s);
+  }
+  if (bt >= 0) for (const q of PSETS.burst) for (let j = 0; j < SUB; j++) { // out with hard deceleration, back to the medallion, settle
+    const t = subT(j), bt = t - HIT.big; if (bt < 0) continue;
+    const center = P0.clone().lerp(M, eInOut(seg(t, HIT.big, HIT.snap)));
+    const out = 1 - Math.exp(-bt * 9), vel = q.v * (0.6 + 0.4 * Math.cos(q.z * 3));
+    const fly = V(Math.cos(q.a) * vel * out * 0.3, Math.sin(q.a) * vel * out * 0.3, q.z * vel * out * 0.15);
+    let p, k = 1, size = q.s;
+    if (!q.settle) {
+      const back = eIn3(seg(t, HIT.big + 0.2, HIT.snap));
+      const tgt = q.onRim ? V(Math.cos(q.ta) * (MED_R + 0.03), Math.sin(q.ta) * (MED_R + 0.03), 0.02) : V(Math.cos(q.ta) * q.tr * MED_R, Math.sin(q.ta) * q.tr * MED_R, 0.04);
+      p = fly.lerp(tgt, back); k = t < HIT.snap ? 1 : Math.exp(-(t - HIT.snap) * 10); size = q.s * (1 - 0.6 * back);
+      if (k < 0.01) continue;
+      p.applyQuaternion(face).add(center);
+    } else { // a few motes drift down and come to rest by 13.5
+      const s = eOut3(seg(t, HIT.big, 13.5));
+      p = fly.applyQuaternion(face).add(center).lerp(V(q.sx, q.sy, q.sz + M.z), s * 0.6);
+      k = 0.35;
+    }
+    putP(p, q.warm > 0.25 ? COL.accent : COL.white, (q.settle ? 1.0 : 3) * k / SUB, size * 0.8);
+  }
+  for (let i = n; i < MAXP; i++) pSize[i] = 0;
+  pGeo.setDrawRange(0, n);
+  pGeo.attributes.position.needsUpdate = pGeo.attributes.color.needsUpdate = pGeo.attributes.size.needsUpdate = true;
+  pMat.uniforms.uFocus.value = camera.position.distanceTo(focusPt);
+  return focusPt;
+}
+
+// ===================================================================================================
+// RENDERING: sub-frames (motion blur + AA + subtle DOF) -> bloom -> anamorphic streak -> grade
+// ===================================================================================================
+const clipAbove = [new THREE.Plane(V(0, 1, 0), 0)], clipBelow = [new THREE.Plane(V(0, -1, 0), 0)];
+const accQuad = new FullScreenQuad(new THREE.ShaderMaterial({
+  uniforms: { tex: { value: null }, w: { value: 1 } }, blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, transparent: true,
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`,
+  fragmentShader: `uniform sampler2D tex; uniform float w; varying vec2 vUv; void main(){ gl_FragColor = vec4(texture2D(tex, vUv).rgb * w, 1.); }`,
+}));
+const HALTON = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+function renderSub(t, k, SPP) {
+  const focus = update(t, SPP > 1 ? SHUTTER / SPP : 0);
+  if (SPP > 1) { // sub-pixel jitter + small aperture offset (lens re-aimed at the focus point)
+    const jx = HALTON(k + 1, 2) - 0.5, jy = HALTON(k + 1, 3) - 0.5, ang = k * 2.39996, ap = 0.006 * Math.sqrt((k + 0.5) / SPP);
+    camera.position.add(V(Math.cos(ang) * ap, Math.sin(ang) * ap, 0).applyQuaternion(camera.quaternion)); camera.lookAt(focus);
+    camera.setViewOffset(W, H, jx, jy, W, H);
+  } else camera.clearViewOffset();
+  camera.updateMatrixWorld();
+  renderer.setRenderTarget(subRT); renderer.setClearColor(COL.black, 1); renderer.clear();
+  world.scale.y = -1; world.updateMatrixWorld(true); renderer.clippingPlanes = clipBelow; renderer.render(scene, camera);   // mirror pass
+  world.scale.y = 1; world.updateMatrixWorld(true); renderer.clippingPlanes = []; renderer.render(floorScene, camera);
+  renderer.clippingPlanes = clipAbove; renderer.render(scene, camera); renderer.clippingPlanes = [];
+}
+const bloom = new UnrealBloomPass(new THREE.Vector2(W, H), 0.32, 0.5, 1.4);
+// anamorphic streak: bright-pass at 1/4 res, wide horizontal blur, accent-tinted
+const SW = Math.round(W / 4), SH = Math.round(H / 4), streakA = RT(SW, SH), streakB = RT(SW, SH);
+const brightQuad = new FullScreenQuad(new THREE.ShaderMaterial({
+  uniforms: { tex: { value: null } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`,
+  fragmentShader: `uniform sampler2D tex; varying vec2 vUv; void main(){ vec3 c = texture2D(tex, vUv).rgb; float m = max(c.r, max(c.g, c.b)); gl_FragColor = vec4(c * smoothstep(4.0, 10.0, m), 1.); }`,
+}));
+const blurQuad = new FullScreenQuad(new THREE.ShaderMaterial({
+  uniforms: { tex: { value: null }, step: { value: 1 }, res: { value: new THREE.Vector2(SW, SH) } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`,
+  fragmentShader: `uniform sampler2D tex; uniform float step; uniform vec2 res; varying vec2 vUv;
+    void main(){ vec3 s = vec3(0.); float tw = 0.; for (int i = -6; i <= 6; i++) { float w = exp(-float(i*i) / 18.); s += texture2D(tex, vUv + vec2(float(i) * step / res.x, 0.)).rgb * w; tw += w; } gl_FragColor = vec4(s / tw, 1.); }`,
+}));
+const finalQuad = new FullScreenQuad(new THREE.ShaderMaterial({
+  uniforms: { tex: { value: null }, streak: { value: null }, overlay: { value: null }, overlayK: { value: 0 }, seed: { value: 0 }, res: { value: new THREE.Vector2(W, H) },
+    tint: { value: COL.accent.clone() }, warm: { value: COL.white.clone() } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`,
+  fragmentShader: `uniform sampler2D tex, streak, overlay; uniform float overlayK, seed; uniform vec2 res; uniform vec3 tint, warm; varying vec2 vUv;
+    float hash(vec2 p){ p = fract(p * vec2(443.897, 441.423) + seed); p += dot(p, p.yx + 19.19); return fract((p.x + p.y) * p.x); }
+    vec3 enc(vec3 c){ return mix(c * 12.92, 1.055 * pow(c, vec3(1./2.4)) - .055, step(.0031308, c)); }
+    void main(){
+      vec3 c = texture2D(tex, vUv).rgb;
+      vec3 s = texture2D(streak, vUv).rgb; c += tint * dot(s, vec3(.33)) * 0.55;          // streak stays accent-hued
+      float m = max(c.r, max(c.g, c.b));
+      if (m > 1.) { float hot = 1. - 1. / (1. + (m - 1.) * .35); c = mix(c / m, warm, hot * .85); } // hue-true roll-off to warm white
+      vec2 q = (vUv - .5) * vec2(1.78, 1.); c *= mix(1., .8, smoothstep(.45, 1.15, length(q)));
+      float l = dot(c, vec3(.2126, .7152, .0722));
+      c += (hash(vUv * res) - .5) * .02 * (.25 + sqrt(l));                                   // film grain
+      c = clamp(enc(max(c, 0.)), 0., 1.);
+      vec4 o = texture2D(overlay, vUv); c = mix(c, o.rgb, o.a * overlayK);
+      c += (hash(vUv * res + 7.) - .5) / 255.;                                               // dither
+      gl_FragColor = vec4(c, 1.); }`,
+}));
+
+// branded variant: wordmark + identity line in the clear space under the medallion (2D overlay)
+const overlayCanvas = document.createElement('canvas'); overlayCanvas.width = W; overlayCanvas.height = H;
+const overlayTex = new THREE.CanvasTexture(overlayCanvas); overlayTex.colorSpace = THREE.NoColorSpace;
+finalQuad.material.uniforms.overlay.value = overlayTex;
+let overlayDrawnFor = -1;
+async function loadFonts() {
+  const faces = [new FontFace('Bebas', 'url(../../brand/fonts/BebasNeue.woff2)'), new FontFace('Lato', 'url(../../brand/fonts/Lato-Italic.woff2)', { style: 'italic' }), new FontFace('Lato', 'url(../../brand/fonts/Lato-Regular.woff2)')];
+  for (const f of faces) document.fonts.add(await f.load());
+}
+function drawOverlay(t) { // masked rises, keyed only on t
+  const g = overlayCanvas.getContext('2d'); g.clearRect(0, 0, W, H);
+  if (VARIANT !== 'branded') return 0;
+  const u = H / 2160, cx = W / 2;
+  const rise = (txt, font, color, y, p, spacing = 0) => {
+    g.save(); g.font = font; g.letterSpacing = spacing * u + 'px'; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+    const hgt = parseFloat(font.match(/(\d+(\.\d+)?)px/)[1]);
+    g.beginPath(); g.rect(0, y - hgt * 1.05, W, hgt * 1.3); g.clip(); g.fillStyle = color; g.fillText(txt, cx + spacing * u / 2, y + (1 - p) * hgt * 1.2); g.restore();
+  };
+  const a = eExpo(seg(t, HIT.snap + 0.05, HIT.snap + 0.5)), b = eExpo(seg(t, HIT.snap + 0.2, HIT.snap + 0.65)), c = eExpo(seg(t, HIT.snap + 0.35, HIT.snap + 0.8));
+  rise('PRABIN AGARWAL', `${150 * u}px Bebas`, HEX.white, 1650 * u, a, 34);
+  rise('Empowering Investors', `italic ${66 * u}px Lato`, HEX.accent, 1762 * u, b, 6);
+  rise('AMFI-registered Mutual Fund Distributor  ·  ARN-41541', `${34 * u}px Lato`, 'rgba(244,241,234,0.62)', 2050 * u, c, 2);
+  return 1;
+}
+
+const sppAt = t => SPP_FIXED || ((t < HIT.drop + 0.1) || (t > HIT.collapse - 0.3 && t < HIT.snap + 0.15) || (t > HIT.line + 0.3 && t < HIT.line + 1.0) ? 8 : 4);
+function seek(t) {
+  t = clamp(t, 0, DUR);
+  const SPP = sppAt(t);
+  brandMark.visible = VARIANT === 'branded';
+  renderer.setRenderTarget(accRT); renderer.setClearColor(0x000000, 1); renderer.clear();
+  for (let k = 0; k < SPP; k++) {
+    const ts = SPP > 1 ? t + SHUTTER * ((k + 0.5) / SPP - 0.5) : t;
+    renderSub(clamp(ts, 0, DUR), k, SPP);
+    renderer.setRenderTarget(accRT); accQuad.material.uniforms.tex.value = subRT.texture; accQuad.material.uniforms.w.value = 1 / SPP; accQuad.render(renderer);
+  }
+  camera.clearViewOffset();
+  bloom.render(renderer, null, accRT, 0, false);
+  renderer.setRenderTarget(streakA); brightQuad.material.uniforms.tex.value = accRT.texture; brightQuad.render(renderer);
+  [1, 3, 8, 20].forEach((s, i) => { const src = i % 2 ? streakB : streakA, dst = i % 2 ? streakA : streakB; renderer.setRenderTarget(dst); blurQuad.material.uniforms.tex.value = src.texture; blurQuad.material.uniforms.step.value = s; blurQuad.render(renderer); });
+  const u = finalQuad.material.uniforms;
+  u.tex.value = accRT.texture; u.streak.value = streakA.texture; u.seed.value = mulberry32(Math.round(t * FPS) + 1)();
+  u.overlayK.value = drawOverlay(t); overlayTex.needsUpdate = true;
+  renderer.setRenderTarget(null); renderer.setClearColor(0x000000, 1); renderer.clear(); finalQuad.render(renderer);
+}
+
+// readback for render.mjs: RGBA, bottom-up
+const gl = renderer.getContext();
+window.FILM = { width: W, height: H, fps: FPS, duration: DUR, flipY: true,
+  // variants differ only from the big hit on; render.mjs renders shared frames once
+  variants: ['plate', 'branded'], variantsFrom: HIT.big, setVariant: v => { VARIANT = v; },
+  pixels: () => { const b = new Uint8Array(W * H * 4); gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, b); return b; } };
+window.seek = seek; window.DURATION = DUR;
+window.ready = loadFonts().then(() => { seek(+Q.get('t') || 0); return true; });
+
+// preview only: click to play with the score (rAF is never used in render mode)
+if (!RENDER) {
+  const audio = new Audio('score.wav');
+  await window.ready;
+  renderer.domElement.addEventListener('click', () => { audio.currentTime = 0; audio.play(); const loop = () => { seek(audio.currentTime); if (!audio.paused) requestAnimationFrame(loop); }; requestAnimationFrame(loop); });
+}
+</script>
+</body>
+</html>

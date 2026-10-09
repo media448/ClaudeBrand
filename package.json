@@ -6,8 +6,9 @@
     "render": "node render.mjs"
   },
   "devDependencies": {
-    "playwright": "1.56.1",
     "@fontsource/bebas-neue": "5.2.5",
-    "@fontsource/lato": "5.2.5"
+    "@fontsource/lato": "5.2.5",
+    "playwright": "1.56.1",
+    "three": "^0.170.0"
   }
 }

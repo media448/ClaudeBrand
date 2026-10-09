@@ -1,10 +1,10 @@
-// Measures the beat grid from score.wav: kick-band onset detection, then a least-squares
+// Usage: node tools/beats.mjs films/<name>
+// Measures the beat grid from <film>/score.wav: kick-band onset detection, then a least-squares
 // tempo/phase fit so the grid extends across bars without drums. Writes beats.json.
 import { readFileSync, writeFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { resolve, join } from 'node:path';
 
-const here = dirname(fileURLToPath(import.meta.url));
+const here = resolve(process.argv[2] || '.');
 const buf = readFileSync(join(here, 'score.wav'));
 const SR = buf.readUInt32LE(24), n = (buf.length - 44) / 4;
 const HOP = 240, WIN = 960; // 5 ms hop
